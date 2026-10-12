@@ -1,0 +1,109 @@
+name: SoleVair PMax Auto-Kill (20-min cadence)
+
+# SoleVair copy of the LolaLooks auto-kill engine (same rules; this store's own Shopify, ad account and campaign ids -
+# store_config.py). Built by Desktop\store-autokill\build_engines.py from the live LolaLooks engine; edit THERE, rebuild.
+#
+# MODE: DRY (drafts / tags / moves NOTHING) until the repo VARIABLE ENGINE_LIVE is set to 1
+#   (Settings -> Secrets and variables -> Actions -> Variables). Sections whose campaigns do not exist yet
+#   (Rising / Proven / Last Chance - store_config.py) are skipped either way.
+#
+# API BUDGET: this ad account has Explorer access = 2,880 Google Ads operations a day (LolaLooks: 15,000). The engine
+# counts its own calls per Pacific day (store_guard.py, DAILY_GOOGLE_API_BUDGET) and skips quietly at the budget.
+# Every 20 min = 72 runs a day; measured calls per run are in every Telegram message.
+#
+# PRIVACY: the CODE is public (free Actions minutes, like the LolaLooks engine); credentials live only in encrypted
+# repo Secrets; run logs (product ids + spend/revenue) are never committed - kept in the PRIVATE Actions cache.
+
+on:
+  schedule:
+    - cron: '17,37,57 * * * *'          # GitHub's scheduler is best-effort (it can skip ticks); an external cron hitting
+                                # workflow_dispatch (as LolaLooks' cron-job.org job does) makes it exact.
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-kill-solevair-pmax-autokill
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Restore engine state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            kills_log_auto.csv
+            winner_kills_log.csv
+            champion_moves_log.csv
+            _last_run_epoch.txt
+            _api_calls.json
+            _fx_cache.json
+          key: engine-state-${{ github.run_id }}
+          restore-keys: |
+            engine-state-
+
+      # a doubled tick (schedule + manual dispatch close together) runs once
+      - name: Cadence gate
+        id: gate
+        run: |
+          GATE_S=600
+          now=$(date +%s)
+          last=$(cat _last_run_epoch.txt 2>/dev/null || echo 0)
+          age=$((now - last))
+          if [ "$age" -lt "$GATE_S" ] && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tick skipped - last engine run ${age}s ago (< ${GATE_S}s)"
+          else
+            echo "$now" > _last_run_epoch.txt
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: steps.gate.outputs.skip != 'true'
+        run: pip install -r requirements.txt
+
+      - name: Run the auto-kill engine
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GOOGLE_DEVELOPER_TOKEN:   ${{ secrets.GOOGLE_DEVELOPER_TOKEN }}
+          GOOGLE_CLIENT_ID:         ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET:     ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN:     ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          GOOGLE_CUSTOMER_ID:       ${{ secrets.GOOGLE_CUSTOMER_ID }}
+          GOOGLE_LOGIN_CUSTOMER_ID: ${{ secrets.GOOGLE_LOGIN_CUSTOMER_ID }}
+          SHOPIFY_STORE:            ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_CLIENT_ID:        ${{ secrets.SHOPIFY_CLIENT_ID }}
+          SHOPIFY_CLIENT_SECRET:    ${{ secrets.SHOPIFY_CLIENT_SECRET }}
+          RESEND_API_KEY:           ${{ secrets.RESEND_API_KEY }}
+          EMAIL_TO:                 ${{ secrets.EMAIL_TO }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
+          PROVEN_BE_JSON:           ${{ secrets.PROVEN_BE_JSON }}
+          ENGINE_LIVE:              ${{ vars.ENGINE_LIVE }}
+        run: python kill_engine_google_auto.py
+
+      - name: Save engine state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            kills_log_auto.csv
+            winner_kills_log.csv
+            champion_moves_log.csv
+            _last_run_epoch.txt
+            _api_calls.json
+            _fx_cache.json
+          key: engine-state-${{ github.run_id }}

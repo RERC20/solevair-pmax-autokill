@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+# kill_engine_google.py — PMax Auto-Kill, GOOGLE-DIRECT data (hourly-fresh)
+# ---------------------------------------------------------------------------
+# Same v4 rules + logging + draft/tag as kill_engine_v4.py (imported, so they
+# stay identical), but instead of Pythago it builds the feed itself:
+#   • Google Ads API  -> per-product cost / clicks / pixel-conv-value (7/14/30d)
+#                        from shopping_performance_view (item_id = shopify_zz_<pid>_<vid>)
+#   • Shopify orders  -> REAL revenue + order count per product (7/14/30d)  [the truth]
+#   • universe        -> live Shopify ACTIVE products only (built-in cross-check, no 15h staleness)
+# ROAS = Shopify revenue / Google cost (Shopify-truth, per the v4 reconciliation).
+#
+# Run:
+#   python kill_engine_google.py          # interactive: shows kills, asks yes/no
+#   python kill_engine_google.py --auto   # unattended (for the hourly task): drafts + logs, no prompt
+# ---------------------------------------------------------------------------
+import sys, argparse, datetime, collections, requests, time
+from openpyxl import Workbook
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
+# reuse the EXACT rules + logging + Shopify write from the Pythago engine
+import google_ads_connect as ga                              # Google creds + token + headers
+from kill_engine_v4 import evaluate, norm, shopify_token, shopify_draft, _Tee, SHOP, SHOP_API, KILL_CAP
+from zoneinfo import ZoneInfo
+import store_config as SC, store_guard as SG                # STORE KIT: this store's ids, FX, API budget
+UK = ZoneInfo(SC.ACCOUNT_TZ)   # STORE KIT: was Europe/London - order dates must be the AD ACCOUNT's day;                              # store + Google Ads account run on UK time
+
+PMAX_CAMPAIGN_ID = SC.RISING_CAMPAIGN_ID   # STORE KIT (None = no Rising campaign yet);                             # now "PMax | Winners | UK" (was all-products)
+# ── CAMPAIGN SPLIT (2026-07-11) ──────────────────────────────────────────────
+# After the Testing/Winners split, the kill engine judges ONLY the Testing
+# campaign. Winners are exempt anyway (tag-skip in the auto runner), but scoping
+# the Google spend query to Testing makes it unambiguous: kills are driven purely
+# by how a product performs in Testing, never by Winners-campaign spend.
+# NOTE (transition): spend before the 11-Jul split lived in the old all-products
+# campaign (id 23620737018, now Winners), so it drops out of this scoped view.
+# That's intentional - products get a clean evaluation slate in the new Testing
+# campaign; the £40/day budget caps any bleed while data re-accumulates.
+# CAMPAIGN SPLIT #2 (2026-08-07): autumn/winter imports test in their own campaign
+# 'PMax | Testing | AW | UK' (24116871559, serves ONLY GMC custom_label_2='aw26').
+# The engine judges spend across BOTH testing campaigns; Winners/Champions stay exempt.
+TESTING_CAMPAIGN_IDS = tuple(SC.TESTING_CAMPAIGN_IDS)   # STORE KIT;   # Testing | UK  +  Testing | AW | UK  +  Testing | AW-B | UK (owner 2026-09-08: no-spend AW products, label aw26b, GBP 100/day)  +  Testing | Men | UK (owner 2026-09-09: the 809 men parked under custom_label_2=mens_paused, GBP 50/day)
+TESTING_CAMPAIGN_ID = TESTING_CAMPAIGN_IDS[0]                # back-compat alias
+RUN_LOG   = 'kill_engine_google_runs.log'
+KILLS_LOG = 'kills_log_google.csv'
+
+def _gql(tok, q, v=None):
+    # 19 Sep 2026: Shopify answered THROTTLED (another job was using the same app's request budget) and the caller's
+    # ['data'] raised KeyError -> "Auto-Kill FAILED". Retry throttles, 5xx and network errors with backoff; only a
+    # real query error (or 8 failed tries) comes back without 'data'.
+    import time as _t
+    last = None
+    for a in range(8):
+        try:
+            r = requests.post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
+                headers={'X-Shopify-Access-Token':tok,'Content-Type':'application/json'},
+                json={'query':q,'variables':v or {}}, timeout=60)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last = f"HTTP {r.status_code}"; _t.sleep(min(30, 2 * 2 ** a)); continue
+            j = r.json()
+            if 'errors' in j and 'THROTTLED' in str(j['errors']).upper():
+                last = 'THROTTLED'; _t.sleep(min(30, 2 * 2 ** a)); continue
+            if 'data' not in j:
+                raise RuntimeError(f"Shopify GraphQL error: {str(j.get('errors', j))[:300]}")
+            return j
+        except requests.RequestException as e:
+            last = str(e)[:120]; _t.sleep(min(30, 2 * 2 ** a))
+    raise RuntimeError(f"Shopify kept failing after 8 tries: {last}")
+
+# ── Google Ads: per-PRODUCT cost/clicks/pixel-value for 7/14/30 day windows ──
+def google_product_perf(run_date):
+    tok=ga.get_access_token()
+    base=ga.ADS_BASE; cid=ga.CUSTOMER_ID
+    def search(q):
+        # 429-aware: brief backoff for per-minute throttles; a persistent 429 means the
+        # DEVELOPER token's daily op quota (Basic Access 15k/day) is spent — raise a
+        # recognisable error so the runner reports "quota exhausted, skipped" not FAILED.
+        # Google ALSO intermittently returns a transient 400 INVALID_ARGUMENT (and 5xx)
+        # on otherwise-valid large-window queries — verified 2026-08-06: the same 30-day
+        # query fails ~1-in-3 then succeeds on retry. Retrying with backoff fixes the
+        # daily "❌ Auto-Kill FAILED" spam. Only raise after all retries are exhausted.
+        # PAGINATED (2026-08-12): a v22 page caps at 10k rows; large windows now exceed
+        # that, and an unpaginated read silently truncates the tail (under-reads spend).
+        # Unlimited pages; the 5-try retry budget applies PER PAGE and resets on success.
+        out = []; token = None
+        last = None
+        attempt = 0
+        while True:
+            body = {'query': q}
+            if token: body['pageToken'] = token
+            r=requests.post(f"{base}/customers/{cid}/googleAds:search", headers=ga._headers(tok), json=body, timeout=90)
+            if r.status_code == 200:
+                j = r.json()
+                out += SG.fx_rows(j.get('results', []))   # STORE KIT: spend in the store currency
+                token = j.get('nextPageToken')
+                if not token:
+                    return out
+                attempt = 0
+                continue
+            attempt += 1
+            last = r
+            if r.status_code == 429:
+                if attempt < 4: time.sleep(10*(attempt+1)); continue
+                raise RuntimeError(f"GOOGLE_QUOTA_EXHAUSTED: 429 after retries — {r.text[:200]}")
+            if r.status_code in (400, 500, 502, 503, 504) and attempt < 4:
+                time.sleep(4*(attempt+1)); continue      # transient Google flake -> retry
+            r.raise_for_status()
+        last.raise_for_status()                          # exhausted retries -> surface real error
+        return []
+    g=collections.defaultdict(lambda: {'cost7':0.0,'cost30':0.0,'clicks30':0})
+    # Windows = ROLLING last N days, INCLUDING today (matches the dashboard timing fix). A same-day
+    # sale counts immediately, so a cross-sell / low-spend sale isn't mis-read as £0 revenue and
+    # false-killed. Rolling (vs the old "ending yesterday") = no abrupt midnight boundary. RULES UNCHANGED.
+    end=run_date.isoformat()                                        # TODAY (included)
+    if not TESTING_CAMPAIGN_IDS:
+        return g                                                   # STORE KIT: no Testing campaign
+    for win,days in (('7',7),('30',30)):
+        start=(run_date-datetime.timedelta(days=days-1)).isoformat()  # today + (N-1) prior days = N dates
+        q=(f"SELECT campaign.id, segments.product_item_id, metrics.cost_micros, metrics.clicks "
+           f"FROM shopping_performance_view WHERE segments.date BETWEEN '{start}' AND '{end}' "
+           f"AND campaign.id IN ({', '.join(TESTING_CAMPAIGN_IDS)})")   # BOTH testing campaigns (splits 2026-07-11 + 2026-08-07)
+        for row in search(q):
+            parts=str((row.get('segments') or {}).get('productItemId') or '').split('_')   # STORE KIT: spend with no product      # shopify_zz_<pid>_<vid>
+            pid=norm(parts[2]) if len(parts)>=3 else None
+            if not pid: continue
+            g[pid][f'cost{win}'] += int(row['metrics'].get('costMicros',0))/1e6
+            if win=='30': g[pid]['clicks30'] += int(row['metrics'].get('clicks',0) or 0)
+    return g
+
+# ── Shopify: live ACTIVE products (id, title, publishedAt, tags) ──
+def shopify_active_products(tok):
+    Q=('query($c:String){products(first:100,after:$c,query:"status:active"){'
+       'pageInfo{hasNextPage endCursor} edges{node{legacyResourceId title publishedAt tags '
+       'priceRangeV2{minVariantPrice{amount}}}}}}')
+    prods={}; cur=None
+    while True:
+        c=_gql(tok,Q,{'c':cur})['data']['products']
+        for e in c['edges']:
+            n=e['node']; pid=norm(n['legacyResourceId'])
+            prods[pid]=dict(name=n.get('title',''), pub=str(n.get('publishedAt') or '')[:10] or '2000-01-01',
+                            tags=n.get('tags') or [],
+                            price=float(((n.get('priceRangeV2') or {}).get('minVariantPrice') or {}).get('amount') or 0))
+        if c['pageInfo']['hasNextPage']: cur=c['pageInfo']['endCursor']
+        else: break
+    return prods
+
+# ── Shopify: REAL revenue + order count per product, for 7/14/30 day windows ──
+def shopify_revenue(tok, run_date):
+    # GROSS sales by design — we do NOT subtract refunds. A refund is usually an order
+    # issue (size/shipping/changed mind), not a sign the product is bad; if it sold, it
+    # counts. So a refunded sale still proves the product can sell and won't be killed for it.
+    # Discounts DO count (2026-07-03): revenue = amount actually paid after ALL discounts (incl order-level).
+    since=(run_date-datetime.timedelta(days=31)).isoformat()
+    # -status:cancelled (2026-07-13, owner: duplicate order #551450): CANCELLED orders never count —
+    # a cancelled order is not a sale and must not shield a tester from the no-sale tiers or inflate
+    # rev windows. REFUNDS still count (firm rule: refund = order issue, not product failure) —
+    # cancellation and refund are different events. Same convention as the winner-pace modules.
+    # CALENDAR windows aligned to the Google cost query (segments.date BETWEEN start..today) AND the
+    # dashboard, so revenue and cost cover the SAME dates (owner 2026-07-07). Replaced the rolling
+    # 7x24h window, which counted a sale's revenue against a cost window that excluded that sale's day —
+    # letting an old sale shield no-sale / below-2.0 products. An order counts in window N iff its UK
+    # calendar date is within [run_date-(N-1), run_date].
+    win_start=[run_date-datetime.timedelta(days=6), run_date-datetime.timedelta(days=13), run_date-datetime.timedelta(days=29)]
+    Q=('query($c:String){orders(first:100,after:$c,query:"created_at:>=%s -status:cancelled"){'
+       'pageInfo{hasNextPage endCursor} edges{node{id createdAt subtotalPriceSet{shopMoney{amount}} '
+       'lineItems(first:100){edges{node{product{legacyResourceId} discountedTotalSet{shopMoney{amount}}}}}}}}}' % since)
+    rev=collections.defaultdict(lambda:[0.0,0.0,0.0])
+    orders=collections.defaultdict(lambda:[set(),set(),set()])
+    cur=None
+    while True:
+        c=_gql(tok,Q,{'c':cur})['data']['orders']
+        for e in c['edges']:
+            node=e['node']; oid=node['id']
+            ca_date=datetime.datetime.fromisoformat(node['createdAt'].replace('Z','+00:00')).astimezone(UK).date()  # UK calendar date
+            # DISCOUNT ALLOCATION: order-level "ACROSS" discounts (Buy-2-10%-off) are NOT pushed into line
+            # discountedTotalSet, so summing lines over-states revenue. subtotalPriceSet = revenue after ALL
+            # discounts, GROSS of refunds (original field) -> scale each line so rev = what it actually sold for.
+            line_sum=sum(float(li['node']['discountedTotalSet']['shopMoney']['amount'])
+                         for li in node['lineItems']['edges'] if li['node'].get('product'))
+            _sub=(node.get('subtotalPriceSet') or {}).get('shopMoney',{}).get('amount')
+            factor=((float(_sub)/line_sum) if (_sub is not None and line_sum>0) else 1.0)
+            for li in node['lineItems']['edges']:
+                pr=li['node'].get('product')
+                if not pr: continue
+                pid=norm(pr['legacyResourceId']); amt=float(li['node']['discountedTotalSet']['shopMoney']['amount'])*factor
+                for i in range(3):                                              # 0=7d, 1=14d, 2=30d
+                    if win_start[i]<=ca_date<=run_date: rev[pid][i]+=amt; orders[pid][i].add(oid)   # calendar, matches cost
+        if c['pageInfo']['hasNextPage']: cur=c['pageInfo']['endCursor']
+        else: break
+    cnt={pid:[len(s) for s in sets] for pid,sets in orders.items()}
+    return rev, cnt
+
+# ── merge -> normalized product dicts (same shape kill_engine_v4.evaluate expects) ──
+def build_feed(run_date):
+    g=google_product_perf(run_date)
+    stok=shopify_token()
+    prods=shopify_active_products(stok)
+    rev,cnt=shopify_revenue(stok, run_date)
+    feed=[]
+    for pid,meta in prods.items():
+        gp=g.get(pid, {}); r=rev.get(pid,[0.0,0.0,0.0]); c=cnt.get(pid,[0,0,0])
+        cost7=gp.get('cost7',0.0)
+        feed.append(dict(pid=pid, name=meta['name'], pub=meta['pub'], tags=meta['tags'],
+            price=meta.get('price',0.0),
+            cost30=gp.get('cost30',0.0), cost7=cost7, clicks30=gp.get('clicks30',0),
+            rev30=r[2], rev14=r[1], rev7=r[0],                       # Shopify = truth
+            roas7=(r[0]/cost7) if cost7>0 else 0.0,                  # Shopify rev 7d / Google cost 7d
+            offconv30=c[2]))
+    return feed
+
+# ── kills log (separate, same columns as v4) ──
+def _write_kills_log(kills, outcomes, run_date, action, ts):
+    import csv as _csv, os as _os
+    new=not _os.path.exists(KILLS_LOG)
+    with open(KILLS_LOG,'a',newline='',encoding='utf-8') as f:
+        w=_csv.writer(f)
+        if new: w.writerow(['timestamp','data_date','mode','outcome','product_id','name','tier','reason',
+                            'days_live','cost_7d','cost_30d','clicks_30d','shop_rev_30d','shop_rev_14d','shop_rev_7d','roas_7d'])
+        for p,tier,why in sorted(kills,key=lambda k:k[1]):
+            dl=(run_date-datetime.date.fromisoformat(p['pub'])).days
+            w.writerow([ts, run_date.isoformat(), action, outcomes.get(p['pid'],''), p['pid'], p['name'], tier, why, dl,
+                        round(p['cost7'],2), round(p['cost30'],2), p['clicks30'],
+                        round(p['rev30'],2), round(p['rev14'],2), round(p['rev7'],2), round(p['roas7'],2)])
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--auto', action='store_true', help='unattended: draft + tag without prompting (for the hourly task)')
+    ap.add_argument('--run-date', help='YYYY-MM-DD (default: today)')
+    ap.add_argument('--out', default='kill_list_google.xlsx')
+    a=ap.parse_args()
+    run_date=datetime.date.fromisoformat(a.run_date) if a.run_date else datetime.datetime.now(UK).date()
+    is_monday=(run_date.weekday()==0)
+    ts=datetime.datetime.now(UK).strftime('%Y-%m-%d %H:%M:%S')
+
+    logf=open(RUN_LOG,'a',encoding='utf-8')
+    logf.write(f"\n{'#'*72}\n# RUN {ts}  |  GOOGLE-DIRECT  |  {'AUTO' if a.auto else 'interactive'}  |  data-date {run_date}\n{'#'*72}\n")
+    real_stdout=sys.stdout; sys.stdout=_Tee(real_stdout, logf)
+    try:
+        print(f"== kill_engine GOOGLE == {run_date} ({run_date.strftime('%A')}) | Mon tiers 3&4 {'ON' if is_monday else 'OFF'} | {ts}")
+        feed=build_feed(run_date)
+        print(f"feed: Google Ads + live Shopify -> {len(feed)} active products (cost from Google, revenue from Shopify orders)")
+
+        # GLITCH GUARD: a live store always has some Shopify revenue over 30 days. If the orders
+        # pull came back empty (£0 across EVERY product) it's a data glitch (failed/empty Shopify
+        # response), not reality — every spending product would falsely read £0-revenue and look
+        # killable. Abort before flagging or drafting anything.
+        if sum(p.get('rev30',0) for p in feed) <= 0:
+            print(f"\n!! ABORTED — Shopify returned £0 revenue across ALL {len(feed)} active products over 30 days."
+                  f"\n   That's an empty/failed orders pull, not real sales. Nothing flagged or drafted — re-run after Shopify recovers.")
+            return
+
+        kills=[]; tiers={}
+        for p in feed:
+            dec,tier,why=evaluate(p, run_date, is_monday)
+            if dec=='KILL': kills.append((p,tier,why)); tiers[tier]=tiers.get(tier,0)+1
+
+        wb=Workbook(); ws=wb.active; ws.title='kill list google'
+        ws.append(['Product ID','Product Name','Kill Tier','Reason','cost_30','clicks_30','ShopRev_30','ShopRev_14','ShopRev_7','ROAS_7','cost_7'])
+        for p,tier,why in sorted(kills,key=lambda k:k[1]):
+            ws.append([int(p['pid']),p['name'],tier,why,round(p['cost30'],2),p['clicks30'],
+                       round(p['rev30'],2),round(p['rev14'],2),round(p['rev7'],2),round(p['roas7'],2),round(p['cost7'],2)])
+        for c in ws['A'][1:]: c.number_format='0'
+        wb.save(a.out)
+
+        print(f"\n{'='*72}\nPRODUCTS TO KILL: {len(kills)}   (by tier: {tiers or '-'})   |   kept: {len(feed)-len(kills)}\n{'='*72}")
+        for i,(p,tier,why) in enumerate(sorted(kills,key=lambda k:k[1]),1):
+            dl=(run_date-datetime.date.fromisoformat(p['pub'])).days
+            print(f"\n{i}. Product ID {p['pid']}   [{tier}]   {p['name'][:52]}")
+            print(f"   reason : {why}")
+            print(f"   metrics: days_live={dl} | spend 7d/30d=£{p['cost7']:.2f}/£{p['cost30']:.2f} | "
+                  f"clicks30={p['clicks30']} | Shopify rev 30d/14d/7d=£{p['rev30']:.2f}/£{p['rev14']:.2f}/£{p['rev7']:.2f} | ROAS7={p['roas7']:.2f}")
+        print(f"\nsaved -> {a.out}")
+
+        outcomes={p['pid']:'FLAGGED' for p,_,_ in kills}
+        action='no kills'
+        if not kills:
+            print("\nNothing to kill this run.")
+        elif len(kills)>KILL_CAP:
+            for k in outcomes: outcomes[k]=f'NOT DRAFTED (over cap {KILL_CAP})'
+            action='BLOCKED (over cap)'
+            print(f"\n** SAFETY STOP: {len(kills)} kills > cap {KILL_CAP}. Not drafting — investigate. (flagged list logged.) **")
+        else:
+            if a.auto:
+                go=True
+            else:
+                print(f"\n>>> {len(kills)} product(s) flagged. What do you want to do?")
+                print("       yes  =  DRAFT them in Shopify + tag 'draft_bad_product', then log")
+                print("       no   =  exit WITHOUT drafting (still logs the flagged list)")
+                print("     type yes or no: ", end='', flush=True)
+                ans=input().strip().lower(); print(f"   (you typed: {ans or '<empty>'})"); go=ans in ('y','yes')
+            if not go:
+                action='EXITED (no draft)'
+                for k in outcomes: outcomes[k]='NOT DRAFTED (you exited)'
+                print("\nExiting without drafting. The flagged list has been logged.")
+            else:
+                action='DRAFTED'
+                print(f"\nDrafting {len(kills)} product(s) + tagging 'draft_bad_product' ...")
+                wtok=shopify_token()
+                for p,tier,why in kills:
+                    res=shopify_draft(wtok, p['pid'])
+                    outcomes[p['pid']]='DRAFTED' if res=='ok' else f'ERROR: {res}'
+                    print(f"  - {p['pid']}  {'DRAFTED + tagged draft_bad_product' if res=='ok' else 'ERROR: '+res}")
+                print(f"\nDone: {sum(1 for v in outcomes.values() if v=='DRAFTED')}/{len(kills)} drafted & tagged 'draft_bad_product'.")
+
+        if kills: _write_kills_log(kills, outcomes, run_date, action, ts)
+        print(f"\nlogs: run -> {RUN_LOG}" + (f"   |   kills -> {KILLS_LOG} (+{len(kills)} rows)" if kills else ""))
+    finally:
+        sys.stdout=real_stdout; logf.flush(); logf.close()
+
+if __name__=='__main__':
+    main()
