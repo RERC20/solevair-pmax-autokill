@@ -195,6 +195,7 @@ def shopify_draft(tok, pid):
 
 # ── v4 rules ─────────────────────────────────────────────────────────────
 def evaluate(p, run_date, is_monday):
+    _RFX = __import__('store_guard').rule_fx()   # STORE KIT: GBP lines -> store currency
     dl=(run_date-datetime.date.fromisoformat(p['pub'])).days
     cost30,cost7,clk = p['cost30'],p['cost7'],p['clicks30']
     rev30,rev14,rev7,roas7,oq = p['rev30'],p['rev14'],p['rev7'],p['roas7'],p['offconv30']
@@ -209,7 +210,7 @@ def evaluate(p, run_date, is_monday):
     # even at 1 day live (e.g. a re-published product). The <3-day grace does NOT shield it.
     # Floor 2.0 -> 2.4 (owner 2026-08-10): blended target is now TRUE 2.5+, so anything
     # loitering in the 2.0-2.4 band dilutes the blend and holds budget from fresh tests.
-    if has_rev and cost7>=5 and roas7<2.4:
+    if has_rev and cost7>=5*_RFX and roas7<2.4:   # STORE KIT: GBP 5 line
         return ('KILL','Tier 6',f'below 2.4 target: ROAS7={roas7:.2f}, £{cost7:.2f}/7d')
     # owner 2026-08-18: 2x -> 1x CPA ("if it's losing we don't want it anymore —
     # we can import a lot of products; not worth risking blended"). A seller that
@@ -231,7 +232,7 @@ def evaluate(p, run_date, is_monday):
     NO_SALE_K = 7.0
     # 5.00 -> 4.00 (owner 2026-08-18): measured on 60d/4,024 products — no 3+-sale
     # winner ever needed more than GBP3.96 before its first sale (p90 2.73).
-    GATE_CAP  = 4.0                               # hard max allowance per never-sold product
+    GATE_CAP  = 4.0*_RFX                               # hard max allowance per never-sold product
     CLICK_GATE = 20                               # Tier-2b: winners needed <=19 clicks
     price = p.get('price', 0.0) or 0.0
     gate = min(price / NO_SALE_K, GATE_CAP) if price > 0 else GATE_CAP
@@ -279,7 +280,7 @@ def evaluate(p, run_date, is_monday):
     # Floor = 2.4 (owner 2026-08-10, raised from 2.0; before that 1.5): blended target is
     # TRUE 2.5+, so ANY burn rate below 2.4 drags the blended ROAS — same floor as Tier 6,
     # measured on 30d.
-    if cost30>=10 and rev30<2.4*cost30:
+    if cost30>=10*_RFX and rev30<2.4*cost30:   # STORE KIT: GBP 10 line
         return ('KILL','Tier 7',f'dribbler: ROAS30={(rev30/cost30):.2f}<2.4, £{cost30:.2f}/30d')
     return ('KEEP',None,'no tier triggered')
 

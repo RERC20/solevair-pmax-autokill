@@ -9,6 +9,10 @@
 #    revenue and use GBP lines (GBP 5 gate, price/7 ...), so every metrics.costMicros the engine reads is converted to
 #    GBP at that day's ECB rate (api.frankfurter.dev; weekends/holidays = the last business day). No rate = the run
 #    stops with an error (a guessed rate is never used). A run with no conversion needed (same currency) is untouched.
+# 3. RULE LINES (17 Oct 2026, Greta = EUR store). The rules' fixed money lines are GBP (GBP 4 no-sale cap, GBP 5 / GBP 10
+#    spend gates). A store selling in another currency compares spend and revenue in ITS currency, so rule_fx() turns
+#    each GBP line into that currency at the latest ECB GBP->store rate (1.0 for a GBP store = unchanged). Ratios (ROAS
+#    2.4, price/7) need no conversion. No rate = the run stops (never a guessed rate).
 import datetime
 import json
 import os
@@ -128,16 +132,47 @@ def fx_rows(rows):
     return rows
 
 
+_RFX = {}
+
+
+def rule_fx():
+    """GBP rule lines -> the store currency (1.0 when the store sells in GBP)."""
+    if "r" in _RFX:
+        return _RFX["r"]
+    rc = getattr(SC, "RULE_CURRENCY", "GBP")
+    mult = float(getattr(SC, "RULE_SPEND_MULT", 1.0) or 1.0)   # store's extra room on the money lines (owner 2026-10-18: US +20%)
+    if SC.STORE_CURRENCY == rc:
+        _RFX["r"] = 1.0 * mult
+        return _RFX["r"]
+    err = ""
+    for attempt in range(3):
+        try:
+            r = requests.get("https://api.frankfurter.dev/v1/latest", params={"base": rc, "symbols": SC.STORE_CURRENCY}, timeout=30)
+            r.raise_for_status()
+            _RFX["r"] = float(r.json()["rates"][SC.STORE_CURRENCY]) * mult
+            return _RFX["r"]
+        except Exception as ex:              # noqa: BLE001
+            err = f"{type(ex).__name__}: {str(ex)[:120]}"
+            __import__("time").sleep(3 * (attempt + 1))
+    raise RuntimeError(f"FX rate {rc}->{SC.STORE_CURRENCY} for the rule lines unavailable ({err}) - run stopped")
+
+
+def money(text):
+    """Report text in the store currency symbol (the engine's messages were written with GBP signs)."""
+    return text.replace("£", "€").replace("GBP", "EUR") if SC.STORE_CURRENCY == "EUR" else text
+
+
 def orders_in_30d():
     """Shopify order count of the last 30 days, or None when it cannot be read. A NEW store can truly have no sales: the
     LolaLooks glitch guard ("GBP 0 revenue across every product = a failed orders pull") only aborts a run here when the
-    store HAS orders (or the count fails) - never because the store is new."""
+    store HAS (non-cancelled) orders (or the count fails) - never because the store is new."""
     from kill_engine_v4 import SHOP, SHOP_API, shopify_token
     since = (datetime.datetime.utcnow() - datetime.timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
         j = _orig_post(f"https://{SHOP}/admin/api/{SHOP_API}/graphql.json",
                        headers={"X-Shopify-Access-Token": shopify_token(), "Content-Type": "application/json"},
-                       json={"query": '{ ordersCount(query:"created_at:>=%s", limit:null){ count } }' % since}, timeout=60).json()
+                       json={"query": '{ ordersCount(query:"created_at:>=%s -status:cancelled", limit:null){ count } }' % since[:10]},
+                       timeout=60).json()   # 17 Oct 2026: cancelled orders excluded (= the engine's revenue pull); date-only filter
         return int(j["data"]["ordersCount"]["count"])
     except Exception:                        # noqa: BLE001
         return None
@@ -145,4 +180,5 @@ def orders_in_30d():
 
 def status_line():
     return (f"Google API calls: {calls_this_run()} this run | {calls_today()} of {SC.DAILY_GOOGLE_API_BUDGET} today (PT day)"
-            + (f" | spend converted {SC.ADS_CURRENCY}->{SC.STORE_CURRENCY} at {rate_for():.4f}" if _rates() else ""))
+            + (f" | spend converted {SC.ADS_CURRENCY}->{SC.STORE_CURRENCY} at {rate_for():.4f}" if _rates() else "")
+            + (f" | GBP rule lines x{rule_fx():.4f} -> {SC.STORE_CURRENCY}" if rule_fx() != 1.0 else ""))

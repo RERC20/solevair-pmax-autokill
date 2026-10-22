@@ -320,7 +320,7 @@ def _variant_item_ids(stok, pid):
                       headers={'X-Shopify-Access-Token': stok, 'Content-Type': 'application/json'},
                       json={'query': q, 'variables': {'id': f"gid://shopify/Product/{pid}"}}, timeout=30).json()
     vs = [e['node']['legacyResourceId'] for e in j['data']['product']['variants']['edges']]
-    return [f"shopify_zz_{pid}_{v}".lower() for v in vs]
+    return [f"{SC.ITEM_PREFIX}_{pid}_{v}".lower() for v in vs]   # STORE KIT: this feed's offer-id prefix
 
 def ads_fast_path(new_winners, stok):
     if not WINNERS_AG_ID:
@@ -337,7 +337,7 @@ def ads_fast_path(new_winners, stok):
             "FROM asset_group_listing_group_filter WHERE asset_group.id IN ("
             + ",".join(str(x) for x in (WINNERS_AG_ID, TESTING_AG_ID, AW_TESTING_AG_ID) if x) + ")")   # STORE KIT
         info = {}
-        for agid in (WINNERS_AG_ID, TESTING_AG_ID, AW_TESTING_AG_ID):
+        for agid in [x for x in (WINNERS_AG_ID, TESTING_AG_ID, AW_TESTING_AG_ID) if x]:   # STORE KIT: skip AGs this store lacks
             ag = [x for x in rows if str(x['assetGroup']['id']) == agid]
             subdiv = None; have = set()
             for x in ag:
@@ -364,6 +364,7 @@ def ads_fast_path(new_winners, stok):
         made = 0
         for agid, node_type in ((WINNERS_AG_ID, 'UNIT_INCLUDED'), (TESTING_AG_ID, 'UNIT_EXCLUDED'),
                                 (AW_TESTING_AG_ID, 'UNIT_EXCLUDED')):
+            if agid not in info: continue                      # STORE KIT: AG this store lacks
             subdiv, have, n_nodes = info[agid]
             ops = []
             for p in new_winners:
@@ -594,9 +595,12 @@ def _tier_daily_spend(run_date, pids, lookback_d=None):
     q = (f"SELECT campaign.id, segments.date, segments.product_item_id, metrics.cost_micros "
          f"FROM shopping_performance_view "
          f"WHERE segments.date BETWEEN '{start}' AND '{run_date.isoformat()}' "
-         f"AND campaign.id IN ({WINNERS_CAMPAIGN_ID}, {CHAMPIONS_CAMPAIGN_ID}, {LC_CAMPAIGN_ID}) AND metrics.cost_micros > 0")
+         "AND campaign.id IN (" + ",".join(str(x) for x in (WINNERS_CAMPAIGN_ID, CHAMPIONS_CAMPAIGN_ID, LC_CAMPAIGN_ID) if x)
+         + ") AND metrics.cost_micros > 0")   # STORE KIT: only the campaigns this store has
     out = collections.defaultdict(list)
     rows = _ads_search(ga, gt, q)
+    if not rows and not SC.LADDER_COMPLETE:
+        return out                     # STORE KIT: a new Rising campaign can truly have no spend yet (no Proven to mis-promote)
     if not rows:
         # v7.7.1: Rising + Proven + Last Chance spend hundreds of pounds a day, so NO spend row at all over 60+ days is a
         # Google glitch, not reality. Read as "no spend", every 4-sale Rising product would pass the Proven entry line and
@@ -652,6 +656,16 @@ def shopify_winner_kill(tok, pid, run_date=None):
     d = j.get('data') or {}
     errs = sum([((d.get(k) or {}).get('userErrors') or []) for k in ('tagsAdd', 'tagsRemove')], [])
     return 'ok -> last chance' if not errs else str(errs)[:120]
+
+
+def _winner_draft_no_lc(tok, pid):
+    """STORE KIT (18 Oct 2026): this store has no Last Chance campaign, so a winner that fails the pace rule is drafted
+    (draft_bad_product, as the pre-Last-Chance rule did) and leaves Rising: w_campaign off, l_camp on."""
+    res = shopify_lc_draft(tok, pid)
+    if res != 'ok':
+        return res
+    shopify_remove_tag(tok, pid, WINNER_TAG); shopify_add_tag(tok, pid, LOST_TAG)
+    return 'ok -> drafted (no Last Chance campaign)'
 
 
 def shopify_lc_draft(tok, pid):
@@ -1171,7 +1185,8 @@ def winner_pace_run(run_date, dry, life=None, shared=None, skip=None, exclude=No
             return res
         for r in flagged:
             if live:
-                r['outcome'] = shopify_winner_kill(tok, r['pid'], run_date)
+                r['outcome'] = (shopify_winner_kill(tok, r['pid'], run_date) if LC_CAMPAIGN_ID
+                                else _winner_draft_no_lc(tok, r['pid']))   # STORE KIT: no Last Chance campaign -> draft
                 print(f"  winner KILL {r['pid']} -> {r['outcome']} | spent £{r['spent']:.2f} > "
                       f"allowance £{r['allow']:.2f} ({r['opened']}) | {r['name'][:40]}")
             else:
@@ -1688,6 +1703,7 @@ def build_report(rows, outcomes, run_date, ts, n_active, n_kills, n_drafted, dry
 
 def send_report(subject, body, xlsx_path=None):
     subject = f"[{SC.STORE_LABEL}] {subject}"   # STORE KIT
+    body = SG.money(body)   # STORE KIT: store currency sign
     if not (RESEND_API_KEY and EMAIL_TO):
         print("!! EMAIL NOT SENT — set the RESEND_API_KEY + EMAIL_TO secrets.")
         if xlsx_path: print(f"   report saved locally: {xlsx_path}")
@@ -1737,7 +1753,7 @@ def send_telegram(text, xlsx_path=None):
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT):
         print("!! TELEGRAM NOT SENT — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID (env or _secrets_local.py).")
         return False
-    text = f"[{SC.STORE_LABEL}] " + text                                  # STORE KIT: which store
+    text = SG.money(f"[{SC.STORE_LABEL}] " + text)                         # STORE KIT: which store + currency sign
     base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"; ok = False
     try:
         parts = _tg_parts(text)

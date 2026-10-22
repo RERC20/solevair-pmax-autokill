@@ -5,15 +5,18 @@ import os
 STORE_LABEL = 'SoleVair'
 ACCOUNT_TZ = 'America/New_York'            # the Google Ads account's time zone (its segments.date days)
 ADS_CURRENCY = 'USD'                     # the ad account bills in this currency ...
-STORE_CURRENCY = 'GBP'                   # ... the store sells in this one (all rule lines are GBP)
+STORE_CURRENCY = 'GBP'                   # ... the store sells in this one (spend is converted to it)
+RULE_CURRENCY = 'GBP'                    # the rules' fixed money lines are written in this one (store_guard.rule_fx)
 FX_LOOKBACK_D = 220                          # daily rates kept for the longest spend window (Last Chance 200 d)
 DAILY_GOOGLE_API_BUDGET = 2000               # of 2,880 Explorer-access operations a day (the feed site shares the quota)
+RULE_SPEND_MULT = 1.0
+ITEM_PREFIX = 'shopify_gb'                    # Merchant Center offer id prefix for this feed (shopify_<country>), e.g. shopify_us                       # extra room on the GBP money lines (gate cap, Tier 6/7 lines): 1.2 = +20% (US)
 
-# campaigns - 'Sales-Performance Max-1' (PMax, $5/day) until the Testing/Rising/Proven/Last Chance ladder is built
-TESTING_CAMPAIGN_IDS = ('24316049739',)
-RISING_CAMPAIGN_ID = None            # LolaLooks "PMax | Winners | UK" equivalent (1-3 sales)
-RISING_AG_ID = None                  # its asset group (item-id fast path)
-TESTING_AG_ID = None
+# campaigns - 'Sales-Performance Max-1' (PMax, $5/day) until the Testing/Rising/Proven/Last Chance ladder is built | 18 Oct: current Testing campaign first + the old paused Sales-PMax campaigns (their spend still counts)
+TESTING_CAMPAIGN_IDS = ('24360282923', '24316049739')
+RISING_CAMPAIGN_ID = '24372635962'            # LolaLooks "PMax | Winners | UK" equivalent (1-3 sales)
+RISING_AG_ID = '6761499769'                  # its asset group (item-id fast path)
+TESTING_AG_ID = '6760791108'
 AW_TESTING_AG_ID = None
 PROVEN_CAMPAIGN_ID = None            # LolaLooks "PMax | Champions | UK" equivalent (4+ sales)
 PROVEN_AG_ID = None
