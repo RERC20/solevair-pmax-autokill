@@ -135,6 +135,33 @@ def fx_rows(rows):
 _RFX = {}
 
 
+_RFX_F = "_fx_rule_cache.json"     # last good rule-line rate (Actions cache), used only when every live source is down
+
+
+def _rule_rate_live(rc, sc):
+    """rc -> sc spot rate from three independent free sources -> (rate, source) or (None, error summary).
+    23 Oct 2026: frankfurter alone went down (HTTP 522) and stopped the Greta run - so it is no longer the only source."""
+    lo = rc.lower(); so = sc.lower()
+    srcs = (("frankfurter", "https://api.frankfurter.dev/v1/latest", {"base": rc, "symbols": sc}, lambda j: j["rates"][sc]),
+            ("open.er-api", f"https://open.er-api.com/v6/latest/{rc}", None, lambda j: j["rates"][sc]),
+            ("currency-api", f"https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/{lo}.json",
+             None, lambda j: j[lo][so]))
+    errs = []
+    for attempt in range(2):
+        for name, url, params, pick in srcs:
+            try:
+                r = requests.get(url, params=params, timeout=20)
+                r.raise_for_status()
+                v = float(pick(r.json()))
+                if 0.2 < v < 5.0:                # sanity: a garbage reply is never used as a rate
+                    return v, name
+                errs.append(f"{name}: implausible rate {v}")
+            except Exception as ex:              # noqa: BLE001
+                errs.append(f"{name}: {type(ex).__name__}: {str(ex)[:90]}")
+        __import__("time").sleep(5)
+    return None, "; ".join(errs[-3:])
+
+
 def rule_fx():
     """GBP rule lines -> the store currency (1.0 when the store sells in GBP)."""
     if "r" in _RFX:
@@ -144,22 +171,35 @@ def rule_fx():
     if SC.STORE_CURRENCY == rc:
         _RFX["r"] = 1.0 * mult
         return _RFX["r"]
-    err = ""
-    for attempt in range(3):
+    pair = f"{rc}->{SC.STORE_CURRENCY}"
+    rate, info = _rule_rate_live(rc, SC.STORE_CURRENCY)
+    today = datetime.date.today().isoformat()
+    if rate is not None:
         try:
-            r = requests.get("https://api.frankfurter.dev/v1/latest", params={"base": rc, "symbols": SC.STORE_CURRENCY}, timeout=30)
-            r.raise_for_status()
-            _RFX["r"] = float(r.json()["rates"][SC.STORE_CURRENCY]) * mult
-            return _RFX["r"]
-        except Exception as ex:              # noqa: BLE001
-            err = f"{type(ex).__name__}: {str(ex)[:120]}"
-            __import__("time").sleep(3 * (attempt + 1))
-    raise RuntimeError(f"FX rate {rc}->{SC.STORE_CURRENCY} for the rule lines unavailable ({err}) - run stopped")
+            with open(_RFX_F, "w", encoding="utf-8") as f:
+                json.dump({"pair": pair, "date": today, "rate": rate, "source": info}, f)
+        except OSError:
+            pass
+    else:
+        c = _read(_RFX_F)
+        fresh = (c.get("pair") == pair and c.get("rate")
+                 and c.get("date", "") >= (datetime.date.today() - datetime.timedelta(days=7)).isoformat())
+        if not fresh:
+            raise RuntimeError(f"FX rate {pair} for the rule lines unavailable from all 3 sources ({info}) and no saved "
+                               f"rate from the last 7 days - run stopped (rules never run at a guessed rate)")
+        rate = float(c["rate"])
+        print(f"  !! live FX sources down ({info}) - using the saved {pair} rate {rate:.4f} from {c['date']}")
+    _RFX["r"] = rate * mult
+    return _RFX["r"]
 
 
 def money(text):
     """Report text in the store currency symbol (the engine's messages were written with GBP signs)."""
-    return text.replace("£", "€").replace("GBP", "EUR") if SC.STORE_CURRENCY == "EUR" else text
+    if SC.STORE_CURRENCY != "EUR":
+        return text
+    # 23 Oct 2026: never rewrite a currency PAIR ("GBP->EUR") or a URL parameter ("base=GBP") - an error message rewritten
+    # to "EUR->EUR" hid what had actually failed
+    return __import__("re").sub(r"(?<![=/A-Za-z])GBP(?!->|[A-Za-z])", "EUR", text.replace("£", "€"))
 
 
 def orders_in_30d():
