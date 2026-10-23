@@ -45,6 +45,7 @@ jobs:
             _last_run_epoch.txt
             _api_calls.json
             _fx_cache.json
+            _fx_rule_cache.json
           key: engine-state-${{ github.run_id }}
           restore-keys: |
             engine-state-
@@ -106,4 +107,5 @@ jobs:
             _last_run_epoch.txt
             _api_calls.json
             _fx_cache.json
+            _fx_rule_cache.json
           key: engine-state-${{ github.run_id }}
