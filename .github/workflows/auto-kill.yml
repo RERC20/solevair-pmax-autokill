@@ -29,6 +29,9 @@ concurrency:
 
 jobs:
   run:
+    # 30 Oct 2026: the engine now runs on RAILWAY (cron inside the service). GitHub runs only if the repo variable
+    # RUN_ON_GITHUB = 1 (emergency fallback) - so cron-job.org / schedule ticks here do nothing.
+    if: ${{ vars.RUN_ON_GITHUB == '1' }}
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
